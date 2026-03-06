@@ -287,7 +287,12 @@ async def publish_bot_config(
             "business_hours":       platform.get("business_hours",      ""),
             "business_phone":       platform.get("business_phone",      ""),
             "business_website":     platform.get("business_website",    ""),
-            "products":             platform.get("products",            []),            "slot_scenarios":       platform.get("slot_scenarios",       []),        },
+            "business_type":        platform.get("business_type",       ""),
+            "target_customers":     platform.get("target_customers",    ""),
+            "faq":                  platform.get("faq",                 ""),
+            "products":             platform.get("products",            []),
+            "slot_scenarios":       platform.get("slot_scenarios",       []),
+        },
     }
 
     topic = f"w/tasks/{WORKER_UUID}"
@@ -301,6 +306,51 @@ async def publish_bot_config(
         return True
     except Exception as e:
         logger.error("❌ MQTT bot_config publish failed: %s", e)
+        return False
+
+
+async def publish_onboarding_data(
+    platform: dict,
+    qa_pairs: list,
+) -> bool:
+    """
+    Send raw onboarding Q&A pairs to the Worker via MQTT.
+
+    Worker receives this, calls Gemini to normalise the answers into BotConfig
+    fields, then merges + persists the resulting config.
+
+    qa_pairs: list of {"question_id": str, "question_text": str, "answer": str}
+    """
+    if not WORKER_UUID:
+        logger.error("WORKER_UUID chưa set trong .env — không thể publish MQTT")
+        return False
+    if not JWT_SECRET_KEY:
+        logger.error("JWT_SECRET_KEY chưa set trong .env")
+        return False
+
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "type": "process_onboarding",
+        "jwt_token": _build_jwt(WORKER_UUID),
+        "payload": {
+            "page_id":      platform.get("page_id", ""),
+            "platform_id":  platform.get("id", ""),
+            "platform_name": platform.get("page_name", ""),
+            "qa_pairs":     qa_pairs,
+        },
+    }
+
+    topic = f"w/tasks/{WORKER_UUID}"
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _publish_sync, topic, command)
+        logger.info(
+            "✅ MQTT process_onboarding → %s | page=%s pairs=%d",
+            topic, platform.get("page_id"), len(qa_pairs),
+        )
+        return True
+    except Exception as e:
+        logger.error("❌ MQTT process_onboarding publish failed: %s", e)
         return False
 
 

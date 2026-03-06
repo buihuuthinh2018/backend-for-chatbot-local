@@ -896,6 +896,120 @@ async def update_ai_config(platform_id: str, body: AIConfigRequest):
     return {"success": True, "mqtt_published": ok}
 
 
+# ── Onboarding ────────────────────────────────────────────────────────────────
+
+ONBOARDING_QUESTIONS = [
+    {
+        "id": "business_name",
+        "question": "Tên doanh nghiệp / thương hiệu của bạn là gì?",
+        "placeholder": "VD: Siêu Nhân Điện Quang",
+        "type": "text",
+        "required": True,
+    },
+    {
+        "id": "business_type",
+        "question": "Doanh nghiệp bạn kinh doanh lĩnh vực gì?",
+        "placeholder": "VD: Bán lẻ thiết bị điện, dịch vụ lắp đặt",
+        "type": "text",
+        "required": True,
+    },
+    {
+        "id": "products",
+        "question": "Liệt kê chi tiết sản phẩm / dịch vụ (kèm giá nếu có)? (tuỳ chọn)",
+        "placeholder": "VD:\n- Bóng đèn LED 9W — 45.000đ\n- Dịch vụ sửa điện tại nhà — liên hệ báo giá\n- Dây điện đồng 1.5mm — 12.000đ/m",
+        "type": "textarea",
+        "required": False,
+    },
+    {
+        "id": "target_customers",
+        "question": "Khách hàng mục tiêu của bạn là ai?",
+        "placeholder": "VD: Hộ gia đình, thợ điện, chủ công trình",
+        "type": "text",
+        "required": False,
+    },
+    {
+        "id": "tone",
+        "question": "Chatbot nên giao tiếp theo phong cách nào?",
+        "type": "choice",
+        "required": True,
+        "choices": ["Thân thiện, gần gũi", "Chuyên nghiệp, lịch sự", "Vui vẻ, hài hước"],
+    },
+    {
+        "id": "contact_info",
+        "question": "Số điện thoại hoặc địa chỉ liên hệ của shop?",
+        "placeholder": "VD: 0901 234 567 — 123 Nguyễn Văn A, Q.1",
+        "type": "text",
+        "required": False,
+    },
+    {
+        "id": "faq",
+        "question": "Câu hỏi thường gặp nhất của khách hàng? (tuỳ chọn)",
+        "placeholder": "VD: Giờ mở cửa? Có giao hàng không? Bảo hành bao lâu?",
+        "type": "textarea",
+        "required": False,
+    },
+]
+
+
+class OnboardingAnswersRequest(BaseModel):
+    answers: dict
+
+
+@app.get("/api/v1/onboarding/questions")
+async def get_onboarding_questions():
+    """Return the static onboarding question list for the frontend interview UI."""
+    return {"questions": ONBOARDING_QUESTIONS}
+
+
+@app.get("/api/v1/onboarding/{platform_id}")
+async def get_onboarding_status(platform_id: str):
+    """Return existing onboarding answers for a platform (for resume support)."""
+    platform = db.get_platform(platform_id)
+    if not platform:
+        raise HTTPException(status_code=404, detail="Platform not found")
+    return {
+        "completed": platform.get("onboarding_completed", False),
+        "answers": platform.get("onboarding_answers", {}),
+    }
+
+
+@app.post("/api/v1/onboarding/{platform_id}")
+async def save_onboarding(platform_id: str, body: OnboardingAnswersRequest):
+    """
+    Persist raw onboarding answers and forward them to the Worker via MQTT.
+    The Worker calls Gemini to normalise answers into BotConfig fields, then
+    merges + persists the resulting config — no client-side field mapping here.
+    """
+    platform = db.get_platform(platform_id)
+    if not platform:
+        raise HTTPException(status_code=404, detail="Platform not found")
+
+    # Persist raw answers to DB (completed flag only — worker does the normalisation)
+    updated = db.save_onboarding(platform_id, body.answers)
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Failed to save onboarding answers")
+
+    logger.info("✅ Onboarding answers saved: platform=%s", platform_id)
+
+    # Build enriched Q&A pairs: attach question text so Gemini can understand context
+    question_map = {q["id"]: q["question"] for q in ONBOARDING_QUESTIONS}
+    qa_pairs = [
+        {
+            "question_id":   qid,
+            "question_text": question_map.get(qid, qid),
+            "answer":        str(ans),
+        }
+        for qid, ans in body.answers.items()
+        if ans  # skip blank / skipped questions
+    ]
+
+    ok = await mqtt_publisher.publish_onboarding_data(platform=updated, qa_pairs=qa_pairs)
+    if not ok:
+        logger.warning("⚠️  MQTT process_onboarding publish failed — worker will not normalise onboarding data")
+
+    return {"success": True, "mqtt_published": ok}
+
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

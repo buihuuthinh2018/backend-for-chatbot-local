@@ -117,3 +117,36 @@ def delete_fb_session(session_id: str):
     sessions = _read("fb_sessions")
     sessions = [s for s in sessions if s["id"] != session_id]
     _write("fb_sessions", sessions)
+
+
+# ── Business knowledge onboarding ────────────────────────────────────────────
+
+def save_onboarding(platform_id: str, answers: dict) -> dict | None:
+    """
+    Persist raw onboarding interview answers on the platform record.
+    Field-level normalisation is intentionally left to the worker (via Gemini).
+    Returns the updated platform record, or None if not found.
+    """
+    changes = {
+        "onboarding_completed": True,
+        "onboarding_answers":   answers,
+    }
+    return update_platform(platform_id, changes)
+
+
+def get_onboarding(platform_id: str) -> dict | None:
+    """Return the raw onboarding_answers dict for a platform, or None."""
+    platform = get_platform(platform_id)
+    if platform is None:
+        return None
+    return platform.get("onboarding_answers")
+
+
+def _map_tone_to_personality(tone_label: str) -> str:
+    """Map Vietnamese tone choice label → BotConfig personality key."""
+    mapping = {
+        "thân thiện, gần gũi": "friendly",
+        "chuyên nghiệp, lịch sự": "professional",
+        "vui vẻ, hài hước": "casual",
+    }
+    return mapping.get(tone_label.lower().strip(), "friendly")
