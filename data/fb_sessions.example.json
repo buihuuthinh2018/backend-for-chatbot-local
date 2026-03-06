@@ -1,0 +1,18 @@
+[
+  {
+    "id": "uuid-here",
+    "created_at": "2026-01-01T00:00:00.000000+00:00",
+    "user_access_token": "YOUR_USER_ACCESS_TOKEN",
+    "pages": [
+      {
+        "page_id": "YOUR_FB_PAGE_ID",
+        "name": "Tên Page",
+        "category": "Danh mục",
+        "access_token": "YOUR_PAGE_ACCESS_TOKEN",
+        "picture_url": "",
+        "fan_count": 0,
+        "is_published": true
+      }
+    ]
+  }
+]

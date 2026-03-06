@@ -1,0 +1,39 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.Python
+venv/
+.venv/
+env/
+
+# ── Environment / Secrets ─────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Sensitive runtime data (chứa access tokens thực) ─────────────────────────
+data/platforms.json
+data/fb_sessions.json
+data/fb_connect_logs/
+data/fb_webhooks/
+
+# ── Windows artifacts ─────────────────────────────────────────────────────────
+nul
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
