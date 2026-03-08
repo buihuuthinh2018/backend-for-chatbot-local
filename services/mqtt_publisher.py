@@ -160,6 +160,48 @@ async def publish_message_event(
         return False
 
 
+async def publish_save_platform(platform: dict) -> bool:
+    """
+    Gửi lệnh save_platform tới Worker qua MQTT.
+    Worker nhận và lưu platform metadata + access token vào SQLite.
+    Gọi sau khi user connect Facebook page thành công.
+    """
+    if not WORKER_UUID:
+        logger.error("WORKER_UUID chưa set — không thể publish save_platform")
+        return False
+    if not JWT_SECRET_KEY:
+        logger.error("JWT_SECRET_KEY chưa set — không thể ký JWT")
+        return False
+
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "type": "save_platform",
+        "jwt_token": _build_jwt(WORKER_UUID),
+        "payload": {
+            "platform_id":       platform["id"],
+            "platform_type":     platform.get("platform_type", "facebook"),
+            "page_id":           platform["page_id"],
+            "page_access_token": platform.get("page_access_token", ""),
+            "page_name":         platform.get("page_name", ""),
+            "page_category":     platform.get("page_category", ""),
+            "page_picture_url":  platform.get("page_picture_url", ""),
+            "fan_count":         platform.get("fan_count", 0),
+            "status":            platform.get("status", "active"),
+            "created_at":        platform.get("created_at", ""),
+        },
+    }
+
+    topic = f"w/tasks/{WORKER_UUID}"
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _publish_sync, topic, command)
+        logger.info("✅ MQTT save_platform → %s | page_id=%s", topic, platform["page_id"])
+        return True
+    except Exception as e:
+        logger.error("❌ MQTT save_platform failed: %s", e)
+        return False
+
+
 async def publish_agent_send(
     platform: dict,
     customer_id: str,
@@ -556,4 +598,36 @@ async def publish_set_bot_enabled(page_id: str, enabled: bool) -> bool:
         return True
     except Exception as e:
         logger.error("❌ MQTT set_bot_enabled failed: %s", e)
+        return False
+
+
+async def publish_set_chatbot_mode(page_id: str, mode: str) -> bool:
+    """
+    Gửi lệnh set_chatbot_mode tới Worker qua MQTT.
+    Worker sẽ chuyển đổi giữa chế độ 'basic' (Q&A cơ bản)
+    và 'expert' (chuyên viên bán hàng AI) cho page đó.
+    """
+    if not WORKER_UUID or not JWT_SECRET_KEY:
+        logger.warning("publish_set_chatbot_mode: WORKER_UUID or JWT_SECRET_KEY not configured")
+        return False
+
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "type": "set_chatbot_mode",
+        "jwt_token": _build_jwt(WORKER_UUID),
+        "payload": {
+            "page_id": page_id,
+            "mode": mode,
+        },
+    }
+
+    topic = f"w/tasks/{WORKER_UUID}"
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _publish_sync, topic, command)
+        label = "🤖 Chuyên Viên" if mode == "expert" else "💬 Hỗ Trợ Cơ Bản"
+        logger.info("%s chatbot mode (MQTT) → page_id=%s mode=%s", label, page_id, mode)
+        return True
+    except Exception as e:
+        logger.error("❌ MQTT set_chatbot_mode failed: %s", e)
         return False

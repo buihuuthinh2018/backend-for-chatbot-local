@@ -16,12 +16,67 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from services import facebook, db, mqtt_publisher
+
+# ── Routing table: { page_id → { platform_id, worker_uuid } } ───────────────────
+# Full platform data (tokens, config) lives in worker SQLite.
+# Backend only needs this lightweight map to route webhooks.
+import httpx
+
+_ROUTING_FILE = os.path.join(os.path.dirname(__file__), "data", "routing.json")
+_routing: dict = {}  # { page_id: { "platform_id": str, "worker_uuid": str } }
+WORKER_API_URL = os.getenv("WORKER_API_URL", "http://localhost:8001")
+
+
+def _load_routing() -> None:
+    global _routing
+    if os.path.exists(_ROUTING_FILE):
+        try:
+            with open(_ROUTING_FILE, "r", encoding="utf-8") as f:
+                _routing = json.load(f)
+            logger.info("📂 Loaded routing for %d page(s)", len(_routing))
+        except Exception as e:
+            logger.warning("Failed to load routing.json: %s", e)
+            _routing = {}
+
+
+def _save_routing() -> None:
+    os.makedirs(os.path.dirname(_ROUTING_FILE), exist_ok=True)
+    try:
+        with open(_ROUTING_FILE, "w", encoding="utf-8") as f:
+            json.dump(_routing, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Failed to save routing.json: %s", e)
+
+
+def _find_routing_by_id(platform_id: str):
+    """Find routing entry by platform_id. Returns (page_id, entry) or (None, None).
+    Handles both: entry['platform_id'] (new format) and entry['id'] (legacy fat format).
+    """
+    for pid, entry in _routing.items():
+        eid = entry.get("platform_id") or entry.get("id")
+        if eid == platform_id:
+            return pid, entry
+    return None, None
+
+
+async def _get_worker_platform(platform_id: str) -> dict | None:
+    """Call worker /api/v1/platforms/{id}/token to get page_access_token + page_id."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{WORKER_API_URL}/api/v1/platforms/{platform_id}/token")
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("Worker token lookup returned %d for %s", r.status_code, platform_id)
+    except Exception as e:
+        logger.warning("Failed to get platform token from worker: %s", e)
+    return None
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("backend-chatbot")
@@ -36,6 +91,7 @@ async def lifespan(app: FastAPI):
     logger.info("   MQTT broker: %s:%s", os.getenv("MQTT_BROKER_URL", "localhost"), os.getenv("MQTT_BROKER_PORT", "1883"))
     logger.info("   WORKER_UUID: %s", os.getenv("WORKER_UUID", "(not set)"))
     logger.info("   JWT_SECRET: %s", "\u2705 set" if os.getenv("JWT_SECRET_KEY") else "\u26a0\ufe0f  NOT SET")
+    _load_routing()
     yield
     logger.info("👋 backend-chatbot shutting down")
 
@@ -197,20 +253,23 @@ async def fb_webhook_event(request: Request):
 
     published = 0
 
-    for entry in data.get("entry", []):
-        page_id = entry.get("id")
+    for fb_entry in data.get("entry", []):
+        page_id = fb_entry.get("id")
 
-        # Tìm platform trong DB
-        platform = db.get_platform_by_page_id(page_id)
-        if not platform:
-            logger.warning("No platform found for page_id %s — skipping", page_id)
+        # Look up routing (page_id → platform_id)
+        routing_entry = _routing.get(page_id)
+        if not routing_entry:
+            logger.warning("No routing found for page_id %s — skipping", page_id)
             continue
 
-        if platform.get("status") != "active":
-            logger.info("Platform %s not active — skipping", page_id)
-            continue
+        # Minimal platform dict: worker has full data in SQLite
+        # Supports both new format (platform_id key) and legacy fat format (id key)
+        platform = {
+            "id": routing_entry.get("platform_id") or routing_entry.get("id"),
+            "page_id": page_id,
+        }
 
-        for event in entry.get("messaging", []):
+        for event in fb_entry.get("messaging", []):
             sender_psid  = event.get("sender",    {}).get("id", "")
             recipient_id = event.get("recipient",  {}).get("id", "")
             is_echo = "message" in event and event["message"].get("is_echo", False)
@@ -346,9 +405,8 @@ async def facebook_auth(body: FacebookCodeRequest):
             "pages": pages,
         })
 
-        # Filter out pages already connected
-        existing_platforms = db.get_platforms()
-        connected_page_ids = {p["page_id"] for p in existing_platforms if p.get("platform_type") == "facebook"}
+        # Filter out pages already connected (use routing as source of truth)
+        connected_page_ids = set(_routing.keys())
 
         pages_response = []
         for page in pages:
@@ -412,8 +470,7 @@ async def facebook_connect(body: FacebookConnectRequest):
     })
 
     # Check if already connected
-    existing = db.get_platform_by_page_id(body.page_id)
-    if existing:
+    if body.page_id in _routing:
         raise HTTPException(status_code=409, detail="This page is already connected.")
 
     page_token = selected_page["access_token"]
@@ -424,25 +481,38 @@ async def facebook_connect(body: FacebookConnectRequest):
         if not webhook_ok:
             raise HTTPException(status_code=500, detail="Failed to subscribe webhook. Check page permissions.")
 
-        # Save to DB (identity only — no chatbot config)
-        platform = db.create_platform({
+        # Build platform record
+        created_at = datetime.now(timezone.utc).isoformat()
+        platform_id = db.generate_id()
+        platform = {
+            "id": platform_id,
             "platform_type": "facebook",
             "page_id": body.page_id,
             "page_name": selected_page["name"],
             "page_category": selected_page.get("category", ""),
             "page_picture_url": selected_page.get("picture_url", ""),
             "fan_count": selected_page.get("fan_count", 0),
-            "page_access_token": page_token,  # In production: encrypt this!
+            "page_access_token": page_token,
             "user_access_token": session["user_access_token"],
             "webhook_subscribed": True,
             "status": "active",
-        })
+            "created_at": created_at,
+        }
 
-        # Send default bot config to worker via MQTT
+        # ① Save minimal routing entry (page_id → platform_id + worker_uuid)
+        _routing[body.page_id] = {
+            "platform_id": platform_id,
+            "worker_uuid": os.getenv("WORKER_UUID", ""),
+        }
+        _save_routing()
+
+        # ② Send full platform data to worker SQLite via MQTT
+        await mqtt_publisher.publish_save_platform(platform)
+
+        # ③ Send default bot config to worker
         await mqtt_publisher.publish_bot_config({
             **platform,
             "chatbot_name": selected_page["name"],
-            "page_name": selected_page["name"],
             "chatbot_description": "",
             "personality": "friendly",
             "tone": "informal",
@@ -457,33 +527,26 @@ async def facebook_connect(body: FacebookConnectRequest):
 
         logger.info("✅ Connected page '%s' (ID: %s)", selected_page["name"], body.page_id)
 
-        # 📝 Log kết quả platform được tạo
+        # 📝 Log kết quả
         _save_fb_connect_log("connect_result", {
             "page_id": platform["page_id"],
             "page_name": platform["page_name"],
-            "page_category": platform.get("page_category"),
-            "fan_count": platform.get("fan_count"),
-            "page_picture_url": platform.get("page_picture_url"),
-            "page_access_token": platform.get("page_access_token"),
-            "user_access_token": platform.get("user_access_token"),
-            "webhook_subscribed": platform.get("webhook_subscribed"),
-            "status": platform.get("status"),
-            "platform_id": platform.get("id"),
-            "created_at": platform.get("created_at"),
+            "platform_id": platform_id,
+            "created_at": created_at,
         })
 
         return {
             "success": True,
             "platform": {
-                "id": platform["id"],
+                "id": platform_id,
                 "platform_type": "facebook",
-                "page_id": platform["page_id"],
-                "page_name": platform["page_name"],
-                "page_picture_url": platform["page_picture_url"],
-                "fan_count": platform["fan_count"],
+                "page_id": body.page_id,
+                "page_name": selected_page["name"],
+                "page_picture_url": selected_page.get("picture_url", ""),
+                "fan_count": selected_page.get("fan_count", 0),
                 "status": "active",
                 "webhook_subscribed": True,
-                "created_at": platform["created_at"],
+                "created_at": created_at,
             },
         }
 
@@ -494,92 +557,41 @@ async def facebook_connect(body: FacebookConnectRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Platforms CRUD ────────────────────────────────────────────────────────────
-
-@app.get("/api/v1/platforms")
-async def list_platforms():
-    """List all connected platforms."""
-    platforms = db.get_platforms()
-    # Don't expose tokens
-    safe_list = []
-    for p in platforms:
-        safe = {k: v for k, v in p.items() if "token" not in k.lower()}
-        safe["access_token_status"] = "valid" if p.get("page_access_token") else "missing"
-        safe_list.append(safe)
-    return {"data": safe_list}
-
-
-@app.get("/api/v1/platforms/{platform_id}")
-async def get_platform(platform_id: str):
-    """Get single platform detail."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-    safe = {k: v for k, v in platform.items() if "token" not in k.lower()}
-    safe["access_token_status"] = "valid" if platform.get("page_access_token") else "missing"
-    return {"data": safe}
-
-
-class PatchPlatformRequest(BaseModel):
-    status: str | None = None
-    access_token_status: str | None = None
-
-
-@app.patch("/api/v1/platforms/{platform_id}")
-async def patch_platform(platform_id: str, body: PatchPlatformRequest):
-    """Partial update: status, access_token_status, etc."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-    changes = {k: v for k, v in body.dict().items() if v is not None}
-    if changes:
-        db.update_platform(platform_id, changes)
-
-    # When status changes, notify the worker to enable/disable the global chatbot
-    if body.status is not None:
-        from services.mqtt_publisher import publish_set_bot_enabled
-        try:
-            await publish_set_bot_enabled(
-                page_id=platform["page_id"],
-                enabled=(body.status == "active"),
-            )
-        except Exception as e:
-            logger.warning("Failed to send set_bot_enabled MQTT: %s", str(e))
-
-    updated = db.get_platform(platform_id)
-    safe = {k: v for k, v in updated.items() if "token" not in k.lower()}
-    return {"success": True, "data": safe}
-
+# ── Platforms management ─────────────────────────────────────────────────────
+# GET / detail / patch → served by worker at /api/v1/platforms
+# DELETE         → backend handles (needs to unsubscribe FB webhook + update routing)
 
 @app.delete("/api/v1/platforms/{platform_id}")
 async def disconnect_platform(platform_id: str):
-    platform = db.get_platform(platform_id)
-    if not platform:
+    page_id, entry = _find_routing_by_id(platform_id)
+    if not entry:
         raise HTTPException(status_code=404, detail="Platform not found")
 
-    # Hủy đăng ký page khỏi app (xóa subscribed_apps) — luôn thử nếu có token
-    if platform.get("page_access_token"):
+    # Get page_access_token from worker to unsubscribe webhook
+    worker_data = await _get_worker_platform(platform_id)
+    if worker_data and worker_data.get("page_access_token"):
         try:
             ok = await facebook.unsubscribe_page_webhook(
-                platform["page_id"],
-                platform["page_access_token"],
+                worker_data["page_id"],
+                worker_data["page_access_token"],
             )
             if ok:
-                logger.info("✅ Page unsubscribed from app: page_id=%s", platform["page_id"])
+                logger.info("✅ Page unsubscribed: page_id=%s", page_id)
             else:
-                logger.warning("⚠️  FB unsubscribe returned false for page_id=%s", platform["page_id"])
+                logger.warning("⚠️  FB unsubscribe returned false for page_id=%s", page_id)
         except Exception as e:
-            logger.warning("❌ Failed to unsubscribe page from app: %s", str(e))
+            logger.warning("❌ Failed to unsubscribe: %s", str(e))
+    else:
+        logger.warning("⚠️  No token from worker for page_id=%s — skipping FB unsubscribe", page_id)
 
-    db.delete_platform(platform_id)
+    # Remove from routing
+    _routing.pop(page_id, None)
+    _save_routing()
 
-    # Notify worker to purge all local data for this page
+    # Tell worker to purge all local data for this page
     from services.mqtt_publisher import publish_delete_page_data
     try:
-        await publish_delete_page_data(
-            page_id=platform["page_id"],
-            platform_id=platform_id,
-        )
+        await publish_delete_page_data(page_id=page_id, platform_id=platform_id)
     except Exception as e:
         logger.warning("Failed to send delete_page_data MQTT: %s", str(e))
 
@@ -589,18 +601,20 @@ async def disconnect_platform(platform_id: str):
 @app.get("/api/v1/platforms/{platform_id}/webhook-status")
 async def webhook_status(platform_id: str):
     """
-    Kiểm tra subscription thực tế trên Facebook:
-    - Gọi GET /{page_id}/subscribed_apps — xem fields nào đang active
-    - Trả về app mode hint và webhook log count
+    Kiểm tra subscription thực tế trên Facebook.
+    Token được lấy từ worker SQLite.
     """
-    platform = db.get_platform(platform_id)
-    if not platform:
+    routing_page_id, entry = _find_routing_by_id(platform_id)
+    if not entry:
         raise HTTPException(status_code=404, detail="Platform not found")
-    page_token = platform.get("page_access_token")
-    if not page_token:
-        raise HTTPException(status_code=400, detail="No page access token stored")
 
-    page_id = platform["page_id"]
+    worker_data = await _get_worker_platform(platform_id)
+    if not worker_data or not worker_data.get("page_access_token"):
+        raise HTTPException(status_code=400, detail="Token not available from worker")
+
+    page_token = worker_data["page_access_token"]
+    page_id = worker_data.get("page_id") or routing_page_id
+    page_name = worker_data.get("page_name", "")
 
     # Check what FB actually has subscribed
     fb_data = await facebook.get_page_subscriptions(page_id, page_token)
@@ -615,7 +629,7 @@ async def webhook_status(platform_id: str):
 
     return {
         "page_id": page_id,
-        "page_name": platform.get("page_name"),
+        "page_name": page_name,
         "fb_response": fb_data,
         "subscribed_fields": subscribed_fields,
         "webhook_logs_count": len(log_files),
@@ -629,276 +643,95 @@ async def webhook_status(platform_id: str):
 
 @app.post("/api/v1/platforms/{platform_id}/resubscribe-webhook")
 async def resubscribe_webhook(platform_id: str):
-    """Force re-subscribe Facebook webhook — use when events stop arriving."""
-    platform = db.get_platform(platform_id)
-    if not platform:
+    """Force re-subscribe Facebook webhook. Token fetched from worker SQLite."""
+    _, entry = _find_routing_by_id(platform_id)
+    if not entry:
         raise HTTPException(status_code=404, detail="Platform not found")
-    page_token = platform.get("page_access_token")
-    if not page_token:
-        raise HTTPException(status_code=400, detail="No page access token stored")
-    page_id = platform["page_id"]
+
+    worker_data = await _get_worker_platform(platform_id)
+    if not worker_data or not worker_data.get("page_access_token"):
+        raise HTTPException(status_code=400, detail="Token not available from worker")
+
+    page_id = worker_data["page_id"]
+    page_token = worker_data["page_access_token"]
     ok = await facebook.subscribe_page_webhook(page_id, page_token)
     if not ok:
         raise HTTPException(status_code=500, detail="Facebook returned failure.")
-    db.update_platform(platform_id, {"webhook_subscribed": True})
+    # Update extra in worker SQLite
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.patch(
+                f"{WORKER_API_URL}/api/v1/platforms/{platform_id}",
+                json={"webhook_subscribed": True},
+            )
+    except Exception:
+        pass  # Non-critical
     return {
         "success": True,
         "page_id": page_id,
-        "page_name": platform.get("page_name"),
+        "page_name": worker_data.get("page_name", ""),
         "message": "Webhook re-subscribed successfully.",
     }
 
-# ── Agent send message ──────────────────────────────────────────────────────────
-
-class AgentSendRequest(BaseModel):
-    page_id: str
-    customer_id: str
-    message_text: str
-    conversation_id: str = ""
-
-
-@app.post("/api/v1/agent-send")
-async def agent_send_message(body: AgentSendRequest):
+@app.post("/api/v1/admin/resync-platforms")
+async def resync_platforms():
     """
-    Gửi tin nhắn từ agent (UI) tới một customer cụ thể.
-    Backend tìm page bằng page_id, publish lệnh send_message qua MQTT tới Worker.
-    Worker gửi qua FB API và lưu vào lịch sử chat với sender_type='agent'.
+    Admin endpoint: re-syncs all platforms to worker SQLite.
+    Reads platforms.json if available, otherwise uses routing.json (fat format from legacy migration).
+    Call once after migration or when worker loses its SQLite.
     """
-    platform = db.get_platform_by_page_id(body.page_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail=f"Platform not found for page_id={body.page_id}")
-    if not platform.get("page_access_token"):
-        raise HTTPException(status_code=400, detail="No page access token stored for this platform")
+    worker_uuid = os.getenv("WORKER_UUID", "")
+    platforms: list = []
 
-    ok = await mqtt_publisher.publish_agent_send(
-        platform=platform,
-        customer_id=body.customer_id,
-        message_text=body.message_text,
-        conversation_id=body.conversation_id,
-    )
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to publish message to worker via MQTT")
+    # Try platforms.json first
+    platforms_file = os.path.join(os.path.dirname(__file__), "data", "platforms.json")
+    if os.path.exists(platforms_file):
+        with open(platforms_file, "r", encoding="utf-8") as f:
+            platforms = json.load(f)
+    else:
+        # Fall back to routing.json entries that have token data (legacy fat format)
+        for page_id, entry in _routing.items():
+            if entry.get("page_access_token"):
+                p = dict(entry)
+                p["page_id"] = page_id
+                if not p.get("id"):
+                    p["id"] = p.get("platform_id", "")
+                platforms.append(p)
 
-    logger.info(
-        "✅ Agent send queued: page=%s customer=%s text=%s",
-        body.page_id, body.customer_id, body.message_text[:80],
-    )
-    return {"success": True}
+    if not platforms:
+        return {"message": "No platform data found to sync", "synced": 0}
 
+    synced = 0
+    for p in platforms:
+        page_id = p.get("page_id")
+        if not page_id:
+            continue
+        # Upsert routing with minimal format
+        if page_id not in _routing or not _routing[page_id].get("platform_id"):
+            _routing[page_id] = {
+                "platform_id": p.get("id") or p.get("platform_id"),
+                "worker_uuid": worker_uuid,
+            }
+        # Push full platform data to worker
+        try:
+            await mqtt_publisher.publish_save_platform(p)
+            synced += 1
+        except Exception as e:
+            logger.warning("Failed to sync page_id=%s: %s", page_id, e)
 
-# ── Agent / Bot control toggle ────────────────────────────────────────────────
-
-class AgentControlRequest(BaseModel):
-    conversation_id: str
-    page_id: str
-    agent_controlled: bool   # true → agent takes over; false → bot resumes
-
-
-@app.post("/api/v1/agent-control")
-async def set_agent_control(body: AgentControlRequest):
-    """
-    Toggle kiểm soát cuộc trò chuyện giữa Bot và Agent.
-
-    Khi agent_controlled=true:
-      - Worker tắt bot reply cho conversation này
-      - Worker hủy slot-filling session đang chạy (nếu có)
-    Khi agent_controlled=false:
-      - Worker bật lại bot reply bình thường
-    """
-    ok = await mqtt_publisher.publish_set_agent_control(
-        conversation_id=body.conversation_id,
-        page_id=body.page_id,
-        agent_controlled=body.agent_controlled,
-    )
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to publish agent-control command to worker")
-
-    mode = "agent" if body.agent_controlled else "bot"
-    logger.info(
-        "✅ Agent control set: conv=%s mode=%s",
-        body.conversation_id, mode,
-    )
-    return {"success": True, "agent_controlled": body.agent_controlled, "mode": mode}
+    _save_routing()
+    logger.info("✅ Resync complete: %d platform(s)", synced)
+    return {"message": f"Synced {synced} platform(s) to worker", "synced": synced}
 
 
-# ── Auto-Reply Config ─────────────────────────────────────────────────────────
+# ── Worker config endpoint ────────────────────────────────────────────────────────────
+# Onboarding questions live here so all workers fetch the same list.
+# Bump _WORKER_CONFIG_VERSION whenever you change onboarding questions —
+# workers check the X-Config-Version header every 4 hours and reload when it changes.
 
-class AutoReplyRule(BaseModel):
-    trigger: str
-    response: str
+_WORKER_CONFIG_VERSION = 1
 
-
-class AutoReplyConfigRequest(BaseModel):
-    auto_replies: list[AutoReplyRule]
-
-
-@app.put("/api/v1/platforms/{platform_id}/auto-replies")
-async def update_auto_replies(platform_id: str, body: AutoReplyConfigRequest):
-    """
-    Save auto-reply (keyword → response) rules for a platform.
-    1. Persist to platform record in JSON DB
-    2. Publish to Worker via MQTT (worker stores in SQLite)
-    """
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-
-    rules = [{"trigger": r.trigger, "response": r.response} for r in body.auto_replies]
-
-    # 1. Save to backend JSON DB
-    db.update_platform(platform_id, {"quick_replies": rules})
-    logger.info("✅ Auto-replies saved to DB: platform=%s rules=%d", platform_id, len(rules))
-
-    # 2. Publish to Worker via MQTT
-    page_id = platform.get("page_id", "")
-    ok = await mqtt_publisher.publish_auto_reply_config(
-        platform_id=platform_id,
-        page_id=page_id,
-        auto_replies=rules,
-    )
-    if not ok:
-        logger.warning("⚠️  MQTT publish failed — worker will NOT have updated auto-replies until next sync")
-
-    return {
-        "success": True,
-        "rules_count": len(rules),
-        "mqtt_published": ok,
-    }
-
-
-@app.get("/api/v1/platforms/{platform_id}/auto-replies")
-async def get_auto_replies(platform_id: str):
-    """Get auto-reply rules for a platform."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-
-    rules = platform.get("quick_replies", [])
-    return {"data": rules}
-
-
-# ── Slot-filling Scenarios ─────────────────────────────────────────────────────
-
-class ScenariosRequest(BaseModel):
-    scenarios: list = []
-
-
-@app.get("/api/v1/platforms/{platform_id}/scenarios")
-async def get_scenarios(platform_id: str):
-    """Get slot-filling scenario definitions for a platform."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-    return {"data": platform.get("slot_scenarios", [])}
-
-
-@app.put("/api/v1/platforms/{platform_id}/scenarios")
-async def update_scenarios(platform_id: str, body: ScenariosRequest):
-    """Save slot-filling scenarios and push them to the worker via MQTT."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-
-    db.update_platform(platform_id, {"slot_scenarios": body.scenarios})
-    logger.info("✅ Scenarios saved: platform=%s count=%d", platform_id, len(body.scenarios))
-
-    updated = db.get_platform(platform_id)
-    ok = await mqtt_publisher.publish_scenarios(platform=updated)
-    if not ok:
-        logger.warning("⚠️  MQTT scenarios publish failed — worker will receive on next bot_config update")
-
-    return {"success": True, "count": len(body.scenarios), "mqtt_published": ok}
-
-class AIConfigRequest(BaseModel):
-    personality: str = "friendly"
-    tone: str = "informal"
-    greeting: str = ""
-    demographics: dict | None = None
-    # Chatbot identity
-    chatbot_name: str = ""
-    chatbot_description: str = ""
-    rules: list = []
-    prohibited_topics: list = []
-    language: str = "vi"
-    # Business knowledge
-    business_name: str = ""
-    business_address: str = ""
-    business_hours: str = ""
-    business_phone: str = ""
-    business_website: str = ""
-    products: list = []
-    # Slot-filling scenarios
-    slot_scenarios: list = []
-
-
-@app.get("/api/v1/platforms/{platform_id}/ai-config")
-async def get_ai_config(platform_id: str):
-    """Get saved AI config for a platform (personality, tone, greeting, business knowledge, scenarios)."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-    return {
-        "personality":          platform.get("personality",          "friendly"),
-        "tone":                 platform.get("tone",                 "informal"),
-        "greeting":             platform.get("greeting",             ""),
-        "chatbot_name":         platform.get("chatbot_name",         ""),
-        "chatbot_description":  platform.get("chatbot_description",  ""),
-        "rules":                platform.get("rules",                []),
-        "prohibited_topics":    platform.get("prohibited_topics",    []),
-        "language":             platform.get("language",             "vi"),
-        "demographics":         platform.get("demographics",         {}),
-        "business_name":        platform.get("business_name",        ""),
-        "business_address":     platform.get("business_address",     ""),
-        "business_hours":       platform.get("business_hours",       ""),
-        "business_phone":       platform.get("business_phone",       ""),
-        "business_website":     platform.get("business_website",     ""),
-        "products":             platform.get("products",             []),
-        "slot_scenarios":       platform.get("slot_scenarios",       []),
-    }
-
-
-@app.put("/api/v1/platforms/{platform_id}/ai-config")
-async def update_ai_config(platform_id: str, body: AIConfigRequest):
-    """Save AI personality, tone, greeting, demographics for a platform."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-
-    changes = {
-        "personality": body.personality,
-        "tone": body.tone,
-        "greeting": body.greeting,
-        "chatbot_name": body.chatbot_name,
-        "chatbot_description": body.chatbot_description,
-        "rules": body.rules,
-        "prohibited_topics": body.prohibited_topics,
-        "language": body.language,
-        "business_name": body.business_name,
-        "business_address": body.business_address,
-        "business_hours": body.business_hours,
-        "business_phone": body.business_phone,
-        "business_website": body.business_website,
-        "products": body.products,
-        "slot_scenarios": body.slot_scenarios,
-    }
-    if body.demographics is not None:
-        changes["demographics"] = body.demographics
-
-    db.update_platform(platform_id, changes)
-    logger.info("✅ AI config saved: platform=%s", platform_id)
-
-    # Publish config to Worker via MQTT so it can use updated personality/tone/greeting
-    updated_platform = db.get_platform(platform_id)
-    ok = await mqtt_publisher.publish_bot_config(platform=updated_platform)
-    if not ok:
-        logger.warning("⚠️  MQTT bot_config publish failed — worker will use stale config until restart")
-
-    return {"success": True, "mqtt_published": ok}
-
-
-# ── Onboarding ────────────────────────────────────────────────────────────────
-
-ONBOARDING_QUESTIONS = [
+_ONBOARDING_QUESTIONS = [
     {
         "id": "business_name",
         "question": "Tên doanh nghiệp / thương hiệu của bạn là gì?",
@@ -951,64 +784,25 @@ ONBOARDING_QUESTIONS = [
 ]
 
 
-class OnboardingAnswersRequest(BaseModel):
-    answers: dict
+@app.get("/api/v1/worker/config")
+async def get_worker_config(response: Response):
+    """
+    Worker configuration endpoint — polled by ChatbotConfigManager at startup
+    and every 4 hours.  Workers read `onboarding_questions` from here so all
+    parallel workers stay in sync.
 
-
-@app.get("/api/v1/onboarding/questions")
-async def get_onboarding_questions():
-    """Return the static onboarding question list for the frontend interview UI."""
-    return {"questions": ONBOARDING_QUESTIONS}
-
-
-@app.get("/api/v1/onboarding/{platform_id}")
-async def get_onboarding_status(platform_id: str):
-    """Return existing onboarding answers for a platform (for resume support)."""
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
+    Response header X-Config-Version lets workers skip a full reload when the
+    version hasn't changed (HEAD request from _check_version()).
+    """
+    response.headers["X-Config-Version"] = str(_WORKER_CONFIG_VERSION)
     return {
-        "completed": platform.get("onboarding_completed", False),
-        "answers": platform.get("onboarding_answers", {}),
+        "version": _WORKER_CONFIG_VERSION,
+        "scenarios": [],
+        "knowledge_base": [],
+        "platforms": [],
+        "business_info": {},
+        "onboarding_questions": _ONBOARDING_QUESTIONS,
     }
-
-
-@app.post("/api/v1/onboarding/{platform_id}")
-async def save_onboarding(platform_id: str, body: OnboardingAnswersRequest):
-    """
-    Persist raw onboarding answers and forward them to the Worker via MQTT.
-    The Worker calls Gemini to normalise answers into BotConfig fields, then
-    merges + persists the resulting config — no client-side field mapping here.
-    """
-    platform = db.get_platform(platform_id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-
-    # Persist raw answers to DB (completed flag only — worker does the normalisation)
-    updated = db.save_onboarding(platform_id, body.answers)
-    if updated is None:
-        raise HTTPException(status_code=500, detail="Failed to save onboarding answers")
-
-    logger.info("✅ Onboarding answers saved: platform=%s", platform_id)
-
-    # Build enriched Q&A pairs: attach question text so Gemini can understand context
-    question_map = {q["id"]: q["question"] for q in ONBOARDING_QUESTIONS}
-    qa_pairs = [
-        {
-            "question_id":   qid,
-            "question_text": question_map.get(qid, qid),
-            "answer":        str(ans),
-        }
-        for qid, ans in body.answers.items()
-        if ans  # skip blank / skipped questions
-    ]
-
-    ok = await mqtt_publisher.publish_onboarding_data(platform=updated, qa_pairs=qa_pairs)
-    if not ok:
-        logger.warning("⚠️  MQTT process_onboarding publish failed — worker will not normalise onboarding data")
-
-    return {"success": True, "mqtt_published": ok}
-
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
