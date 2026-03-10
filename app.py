@@ -7,9 +7,11 @@ Endpoints:
   GET  /api/v1/platforms               — List connected platforms
   DELETE /api/v1/platforms/:id         — Disconnect platform (unsubscribe + delete)
 """
+import asyncio
 import os
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -30,7 +32,7 @@ import httpx
 
 _ROUTING_FILE = os.path.join(os.path.dirname(__file__), "data", "routing.json")
 _routing: dict = {}  # { page_id: { "platform_id": str, "worker_uuid": str } }
-WORKER_API_URL = os.getenv("WORKER_API_URL", "http://localhost:8001")
+WORKER_API_URL = os.getenv("WORKER_API_URL", "http://localhost:8000")
 
 
 def _load_routing() -> None:
@@ -90,7 +92,7 @@ async def lifespan(app: FastAPI):
     logger.info("   FB_WEBHOOK_VERIFY_TOKEN: %s", "✅ set" if os.getenv("FB_WEBHOOK_VERIFY_TOKEN") else "⚠️  NOT SET")
     logger.info("   MQTT broker: %s:%s", os.getenv("MQTT_BROKER_URL", "localhost"), os.getenv("MQTT_BROKER_PORT", "1883"))
     logger.info("   WORKER_UUID: %s", os.getenv("WORKER_UUID", "(not set)"))
-    logger.info("   JWT_SECRET: %s", "\u2705 set" if os.getenv("JWT_SECRET_KEY") else "\u26a0\ufe0f  NOT SET")
+    logger.info("   JWT_SECRET: %s", "✅ set" if os.getenv("JWT_SECRET_KEY") else "⚠️  NOT SET")
     _load_routing()
     yield
     logger.info("👋 backend-chatbot shutting down")
@@ -405,8 +407,32 @@ async def facebook_auth(body: FacebookCodeRequest):
             "pages": pages,
         })
 
-        # Filter out pages already connected (use routing as source of truth)
-        connected_page_ids = set(_routing.keys())
+        # Verify which pages are truly connected — cross-check routing against worker.
+        # routing.json may be stale (worker DB was cleared), so we confirm each entry.
+        truly_connected: set[str] = set()
+        stale_page_ids: list[str] = []
+        for page_id_in_routing, entry in list(_routing.items()):
+            platform_id = entry.get("platform_id") or entry.get("id", "")
+            if platform_id:
+                try:
+                    async with httpx.AsyncClient(timeout=3.0) as hc:
+                        wr = await hc.get(f"{WORKER_API_URL}/api/v1/platforms/{platform_id}")
+                        if wr.status_code == 200:
+                            truly_connected.add(page_id_in_routing)
+                        else:
+                            stale_page_ids.append(page_id_in_routing)
+                except Exception:
+                    # Worker unreachable — trust routing as-is to avoid false negatives
+                    truly_connected.add(page_id_in_routing)
+            else:
+                stale_page_ids.append(page_id_in_routing)
+
+        # Clean up stale routing entries whose data no longer exists on worker
+        if stale_page_ids:
+            for pid in stale_page_ids:
+                _routing.pop(pid, None)
+                logger.info("🗑️  Removed stale routing entry for page_id=%s", pid)
+            _save_routing()
 
         pages_response = []
         for page in pages:
@@ -417,7 +443,7 @@ async def facebook_auth(body: FacebookCodeRequest):
                 "picture_url": page["picture_url"],
                 "fan_count": page["fan_count"],
                 "is_published": page["is_published"],
-                "already_connected": page["page_id"] in connected_page_ids,
+                "already_connected": page["page_id"] in truly_connected,
             })
 
         # Save session temporarily (user_token + pages with their tokens)
@@ -469,9 +495,25 @@ async def facebook_connect(body: FacebookConnectRequest):
         "user_access_token": session.get("user_access_token"),
     })
 
-    # Check if already connected
+    # Check if already connected — verify against worker to avoid stale routing false-positives
     if body.page_id in _routing:
-        raise HTTPException(status_code=409, detail="This page is already connected.")
+        entry = _routing[body.page_id]
+        platform_id = entry.get("platform_id") or entry.get("id", "")
+        worker_has_platform = False
+        if platform_id:
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as hc:
+                    wr = await hc.get(f"{WORKER_API_URL}/api/v1/platforms/{platform_id}")
+                    worker_has_platform = wr.status_code == 200
+            except Exception:
+                worker_has_platform = True  # worker unreachable — be safe, block duplicate
+        if worker_has_platform:
+            raise HTTPException(status_code=409, detail="This page is already connected.")
+        else:
+            # Stale routing — worker data was cleared, allow reconnect
+            logger.info("⚠️  Stale routing for page_id=%s — allowing reconnect", body.page_id)
+            _routing.pop(body.page_id, None)
+            _save_routing()
 
     page_token = selected_page["access_token"]
 
@@ -724,12 +766,166 @@ async def resync_platforms():
     return {"message": f"Synced {synced} platform(s) to worker", "synced": synced}
 
 
+@app.post("/api/v1/admin/test-mqtt")
+async def test_mqtt():
+    """
+    Kiểm tra kết nối MQTT end-to-end:
+      1. Ping broker  — thử kết nối TCP tới MQTT broker
+      2. Publish ping — gửi command type=ping tới w/tasks/{WORKER_UUID} (JWT-signed)
+      3. Check worker — gọi GET {WORKER_API_URL}/health để xem worker đang chạy không
+    Trả về report chi tiết để debug.
+    """
+    import socket
+    import time as _time
+
+    broker_url  = os.getenv("MQTT_BROKER_URL", "localhost")
+    broker_port = int(os.getenv("MQTT_BROKER_PORT", "1883"))
+    worker_uuid = os.getenv("WORKER_UUID", "")
+    jwt_secret  = os.getenv("JWT_SECRET_KEY", "")
+    mqtt_user   = os.getenv("MQTT_USERNAME", "")
+    mqtt_pass   = os.getenv("MQTT_PASSWORD", "")
+
+    report: dict = {
+        "config": {
+            "mqtt_broker": f"{broker_url}:{broker_port}",
+            "worker_uuid": worker_uuid or "(not set)",
+            "worker_api":  WORKER_API_URL,
+            "jwt_secret":  "✅ set" if jwt_secret else "❌ NOT SET",
+            "mqtt_auth":   "✅ set" if mqtt_user else "none",
+        },
+        "broker_tcp": None,
+        "mqtt_publish": None,
+        "worker_http": None,
+    }
+
+    # ── 1. TCP ping to broker ─────────────────────────────────────────────────
+    t0 = _time.monotonic()
+    try:
+        with socket.create_connection((broker_url, broker_port), timeout=5):
+            pass
+        report["broker_tcp"] = {"ok": True, "ms": round((_time.monotonic() - t0) * 1000)}
+    except Exception as e:
+        report["broker_tcp"] = {"ok": False, "error": str(e)}
+
+    # ── 2. Publish a ping command via MQTT ────────────────────────────────────
+    if not worker_uuid:
+        report["mqtt_publish"] = {"ok": False, "error": "WORKER_UUID not set in .env"}
+    elif not jwt_secret:
+        report["mqtt_publish"] = {"ok": False, "error": "JWT_SECRET_KEY not set in .env"}
+    else:
+        import jwt as _jwt
+        ping_payload = {
+            "command_id": str(uuid.uuid4()),
+            "type": "ping",
+            "jwt_token": _jwt.encode(
+                {"worker_uuid": worker_uuid, "iat": int(_time.time()), "exp": int(_time.time()) + 60},
+                jwt_secret,
+                algorithm="HS256",
+            ),
+            "payload": {"source": "backend-chatbot test-mqtt endpoint"},
+        }
+        topic = f"w/tasks/{worker_uuid}"
+        t1 = _time.monotonic()
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, mqtt_publisher._publish_sync, topic, ping_payload)
+            report["mqtt_publish"] = {
+                "ok": True,
+                "topic": topic,
+                "command_id": ping_payload["command_id"],
+                "ms": round((_time.monotonic() - t1) * 1000),
+            }
+        except Exception as e:
+            report["mqtt_publish"] = {"ok": False, "topic": topic, "error": str(e)}
+
+    # ── 3. HTTP health check on worker ───────────────────────────────────────
+    t2 = _time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as hc:
+            hr = await hc.get(f"{WORKER_API_URL}/health")
+            report["worker_http"] = {
+                "ok": hr.status_code == 200,
+                "status_code": hr.status_code,
+                "url": f"{WORKER_API_URL}/health",
+                "ms": round((_time.monotonic() - t2) * 1000),
+            }
+            try:
+                report["worker_http"]["body"] = hr.json()
+            except Exception:
+                pass
+    except Exception as e:
+        report["worker_http"] = {
+            "ok": False,
+            "url": f"{WORKER_API_URL}/health",
+            "error": str(e),
+        }
+
+    all_ok = all(
+        v.get("ok") if isinstance(v, dict) else False
+        for v in [report["broker_tcp"], report["mqtt_publish"], report["worker_http"]]
+    )
+    report["overall"] = "✅ ALL OK" if all_ok else "❌ ISSUES FOUND"
+    return report
+
+
+@app.post("/api/v1/admin/reset-all")
+async def admin_reset_all():
+    """
+    Xóa sạch toàn bộ data kết nối:
+      - routing.json (backend)
+      - fb_sessions.json (backend)
+      - platform_tokens + bot_configs + conversations + messages + customers
+        + slot_sessions + slot_leads + test_chat_history (worker SQLite)
+    Dùng khi cần reset hoàn toàn để kết nối lại từ đầu.
+    """
+    global _routing
+    result: dict = {}
+
+    # ── Backend: clear routing ────────────────────────────────────────────────
+    _routing = {}
+    _save_routing()
+    result["routing"] = "cleared"
+
+    # ── Backend: clear sessions ───────────────────────────────────────────────
+    try:
+        sessions_file = os.path.join(os.path.dirname(__file__), "data", "fb_sessions.json")
+        with open(sessions_file, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        result["fb_sessions"] = "cleared"
+    except Exception as e:
+        result["fb_sessions"] = f"error: {e}"
+
+    # ── Worker: clear all tables via DELETE endpoint ──────────────────────────
+    worker_tables = [
+        "platform_tokens", "bot_configs", "conversations", "messages",
+        "customers", "slot_sessions", "slot_leads", "test_chat_history",
+        "workflow_logs",
+    ]
+    worker_cleared = []
+    worker_errors = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            wr = await hc.post(f"{WORKER_API_URL}/api/v1/admin/reset-all")
+            if wr.status_code == 200:
+                worker_cleared = wr.json().get("cleared", worker_tables)
+            else:
+                worker_errors.append(f"HTTP {wr.status_code}: {wr.text[:200]}")
+    except Exception as e:
+        worker_errors.append(str(e))
+
+    result["worker_tables"] = worker_cleared if worker_cleared else {"errors": worker_errors}
+    logger.info("🗑️  admin reset-all: routing cleared, sessions cleared, worker=%s", worker_cleared or worker_errors)
+    return {"success": True, "cleared": result}
+
+
+# KB is now stored in the worker's SQLite (wkr-test-2).
+# Backend no longer holds KB data. _WORKER_CONFIG_VERSION kept for worker/config header.
+_WORKER_CONFIG_VERSION = 1
+
+
 # ── Worker config endpoint ────────────────────────────────────────────────────────────
 # Onboarding questions live here so all workers fetch the same list.
-# Bump _WORKER_CONFIG_VERSION whenever you change onboarding questions —
-# workers check the X-Config-Version header every 4 hours and reload when it changes.
-
-_WORKER_CONFIG_VERSION = 1
+# Workers check the X-Config-Version header every 4 hours and reload when it changes.
 
 _ONBOARDING_QUESTIONS = [
     {
@@ -794,11 +990,12 @@ async def get_worker_config(response: Response):
     Response header X-Config-Version lets workers skip a full reload when the
     version hasn't changed (HEAD request from _check_version()).
     """
+    # Defensive: version consistency check.
     response.headers["X-Config-Version"] = str(_WORKER_CONFIG_VERSION)
     return {
         "version": _WORKER_CONFIG_VERSION,
         "scenarios": [],
-        "knowledge_base": [],
+        "knowledge_base": [],   # KB is now owned by the worker (SQLite) — not served here.
         "platforms": [],
         "business_info": {},
         "onboarding_questions": _ONBOARDING_QUESTIONS,

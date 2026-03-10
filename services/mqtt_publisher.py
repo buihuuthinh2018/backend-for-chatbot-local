@@ -111,16 +111,33 @@ async def publish_message_event(
 
     if event_type == "message":
         msg_obj = event_data.get("message", {})
-        content_text    = msg_obj.get("text", "")
         platform_msg_id = msg_obj.get("mid", "")
+        # Check for attachments (images, videos, audio, files, stickers)
+        attachments = msg_obj.get("attachments", [])
+        if attachments:
+            att = attachments[0]
+            att_type = att.get("type", "image")   # "image" | "video" | "audio" | "file" | "fallback" | "sticker"
+            att_url = att.get("payload", {}).get("url", "") or att.get("payload", {}).get("sticker_id", "")
+            if att_type == "sticker":
+                att_type = "image"
+            content_type = att_type if att_type in ("image", "video", "audio", "file") else "image"
+            content_url = att_url
+        else:
+            content_type = "text"
+            content_url = ""
+            content_text = msg_obj.get("text", "")
     elif event_type == "message_echo":
         msg_obj = event_data.get("message", {})
         content_text    = msg_obj.get("text", "")
+        content_type    = "text"
+        content_url     = ""
         platform_msg_id = msg_obj.get("mid", "")
         command_type = "agent_message"
     elif event_type == "postback":
         pb = event_data.get("postback", {})
         content_text = pb.get("title", "") or pb.get("payload", "")
+        content_type = "text"
+        content_url  = ""
 
     # ── Build command ─────────────────────────────────────────────────────────
     command = {
@@ -134,8 +151,9 @@ async def publish_message_event(
             "customer_id": sender_psid,
             "customer_name": "",
             "message": {
-                "content_type": "text",
+                "content_type": content_type,
                 "content_text": content_text,
+                "content_url": content_url,
             },
             "platform_message_id": platform_msg_id,
             # Standalone extension: worker dùng khi không có token trong SQLite
@@ -151,8 +169,8 @@ async def publish_message_event(
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _publish_sync, topic, command)
         logger.info(
-            "✅ MQTT published → %s | type=%s | text=%s",
-            topic, event_type, content_text[:80],
+            "✅ MQTT published → %s | type=%s | content_type=%s | text=%s",
+            topic, event_type, content_type, (content_text or content_url)[:80],
         )
         return True
     except Exception as e:
