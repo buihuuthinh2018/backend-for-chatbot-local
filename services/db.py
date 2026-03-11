@@ -42,58 +42,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── Platforms (connected Facebook pages / Zalo OAs / etc.) ──────────────────
-
-def get_platforms() -> list[dict]:
-    return _read("platforms")
-
-
-def get_platform(platform_id: str) -> dict | None:
-    for p in _read("platforms"):
-        if p["id"] == platform_id:
-            return p
-    return None
-
-
-def get_platform_by_page_id(page_id: str) -> dict | None:
-    for p in _read("platforms"):
-        if p.get("page_id") == page_id:
-            return p
-    return None
-
-
-def create_platform(data: dict) -> dict:
-    platforms = _read("platforms")
-    record = {
-        "id": generate_id(),
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        **data,
-    }
-    platforms.append(record)
-    _write("platforms", platforms)
-    return record
-
-
-def update_platform(platform_id: str, changes: dict) -> dict | None:
-    platforms = _read("platforms")
-    for i, p in enumerate(platforms):
-        if p["id"] == platform_id:
-            platforms[i] = {**p, **changes, "updated_at": now_iso()}
-            _write("platforms", platforms)
-            return platforms[i]
-    return None
-
-
-def delete_platform(platform_id: str) -> bool:
-    platforms = _read("platforms")
-    new_list = [p for p in platforms if p["id"] != platform_id]
-    if len(new_list) == len(platforms):
-        return False
-    _write("platforms", new_list)
-    return True
-
-
 # ── Facebook OAuth sessions (temporary, for code exchange) ──────────────────
 
 def save_fb_session(session_id: str, data: dict):
@@ -118,35 +66,3 @@ def delete_fb_session(session_id: str):
     sessions = [s for s in sessions if s["id"] != session_id]
     _write("fb_sessions", sessions)
 
-
-# ── Business knowledge onboarding ────────────────────────────────────────────
-
-def save_onboarding(platform_id: str, answers: dict) -> dict | None:
-    """
-    Persist raw onboarding interview answers on the platform record.
-    Field-level normalisation is intentionally left to the worker (via Gemini).
-    Returns the updated platform record, or None if not found.
-    """
-    changes = {
-        "onboarding_completed": True,
-        "onboarding_answers":   answers,
-    }
-    return update_platform(platform_id, changes)
-
-
-def get_onboarding(platform_id: str) -> dict | None:
-    """Return the raw onboarding_answers dict for a platform, or None."""
-    platform = get_platform(platform_id)
-    if platform is None:
-        return None
-    return platform.get("onboarding_answers")
-
-
-def _map_tone_to_personality(tone_label: str) -> str:
-    """Map Vietnamese tone choice label → BotConfig personality key."""
-    mapping = {
-        "thân thiện, gần gũi": "friendly",
-        "chuyên nghiệp, lịch sự": "professional",
-        "vui vẻ, hài hước": "casual",
-    }
-    return mapping.get(tone_label.lower().strip(), "friendly")

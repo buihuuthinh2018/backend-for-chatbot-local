@@ -146,24 +146,6 @@ async def subscribe_page_webhook(page_id: str, page_access_token: str) -> bool:
         return success
 
 
-async def get_page_info(page_id: str, page_access_token: str) -> dict:
-    """Lấy thông tin chi tiết của page."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{FB_GRAPH_URL}/{page_id}",
-            params={
-                "access_token": page_access_token,
-                "fields": "id,name,category,picture{url},fan_count,is_published,link",
-            },
-        )
-        data = resp.json()
-
-        if "error" in data:
-            raise Exception(data["error"].get("message", "Failed to get page info"))
-
-        return data
-
-
 async def unsubscribe_page_webhook(page_id: str, page_access_token: str) -> bool:
     """
     Hủy kết nối page khỏi app hoàn toàn.
