@@ -30,30 +30,26 @@ from services import facebook, db, mqtt_publisher
 # Backend only needs this lightweight map to route webhooks.
 import httpx
 
-_ROUTING_FILE = os.path.join(os.path.dirname(__file__), "data", "routing.json")
 _routing: dict = {}  # { page_id: { "platform_id": str, "worker_uuid": str } }
-WORKER_API_URL = os.getenv("WORKER_API_URL", "http://localhost:8000")
+WORKER_API_URL  = os.getenv("WORKER_API_URL", "http://localhost:8000")
+WORKSPACE_ID    = os.getenv("WORKSPACE_ID", "default")
+_PLATFORMS_FILE = os.path.join(os.path.dirname(__file__), "data", "platforms.json")
 
 
-def _load_routing() -> None:
-    global _routing
-    if os.path.exists(_ROUTING_FILE):
+def _load_platforms_json() -> list:
+    if os.path.exists(_PLATFORMS_FILE):
         try:
-            with open(_ROUTING_FILE, "r", encoding="utf-8") as f:
-                _routing = json.load(f)
-            logger.info("📂 Loaded routing for %d page(s)", len(_routing))
-        except Exception as e:
-            logger.warning("Failed to load routing.json: %s", e)
-            _routing = {}
+            with open(_PLATFORMS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
 
 
-def _save_routing() -> None:
-    os.makedirs(os.path.dirname(_ROUTING_FILE), exist_ok=True)
-    try:
-        with open(_ROUTING_FILE, "w", encoding="utf-8") as f:
-            json.dump(_routing, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("Failed to save routing.json: %s", e)
+def _save_platforms_json(platforms: list) -> None:
+    os.makedirs(os.path.dirname(_PLATFORMS_FILE), exist_ok=True)
+    with open(_PLATFORMS_FILE, "w", encoding="utf-8") as f:
+        json.dump(platforms, f, ensure_ascii=False, indent=2)
 
 
 def _find_routing_by_id(platform_id: str):
@@ -68,10 +64,10 @@ def _find_routing_by_id(platform_id: str):
 
 
 async def _get_worker_platform(platform_id: str) -> dict | None:
-    """Call worker /api/v1/platforms/{id}/token to get page_access_token + page_id."""
+    """Call worker /api/v1/channels/{id}/token to get page_access_token + channel info."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{WORKER_API_URL}/api/v1/platforms/{platform_id}/token")
+            r = await client.get(f"{WORKER_API_URL}/api/v1/channels/{platform_id}/token")
             if r.status_code == 200:
                 return r.json()
             logger.warning("Worker token lookup returned %d for %s", r.status_code, platform_id)
@@ -86,6 +82,7 @@ logger = logging.getLogger("backend-chatbot")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _routing
     logger.info("🚀 backend-chatbot starting")
     logger.info("   FB_APP_ID: %s", os.getenv("FB_APP_ID", "(not set)"))
     logger.info("   FB_REDIRECT_URI: %s", os.getenv("FB_REDIRECT_URI", "(not set)"))
@@ -93,8 +90,11 @@ async def lifespan(app: FastAPI):
     logger.info("   MQTT broker: %s:%s", os.getenv("MQTT_BROKER_URL", "localhost"), os.getenv("MQTT_BROKER_PORT", "1883"))
     logger.info("   WORKER_UUID: %s", os.getenv("WORKER_UUID", "(not set)"))
     logger.info("   JWT_SECRET: %s", "✅ set" if os.getenv("JWT_SECRET_KEY") else "⚠️  NOT SET")
-    _load_routing()
+    await db.init_db()
+    _routing = await db.get_routing()
+    logger.info("📂 Loaded routing for %d page(s)", len(_routing))
     yield
+    await db.close_db()
     logger.info("👋 backend-chatbot shutting down")
 
 
@@ -416,7 +416,7 @@ async def facebook_auth(body: FacebookCodeRequest):
             if platform_id:
                 try:
                     async with httpx.AsyncClient(timeout=3.0) as hc:
-                        wr = await hc.get(f"{WORKER_API_URL}/api/v1/platforms/{platform_id}")
+                        wr = await hc.get(f"{WORKER_API_URL}/api/v1/channels/{platform_id}")
                         if wr.status_code == 200:
                             truly_connected.add(page_id_in_routing)
                         else:
@@ -432,7 +432,8 @@ async def facebook_auth(body: FacebookCodeRequest):
             for pid in stale_page_ids:
                 _routing.pop(pid, None)
                 logger.info("🗑️  Removed stale routing entry for page_id=%s", pid)
-            _save_routing()
+            for pid in stale_page_ids:
+                await db.delete_routing_entry(pid)
 
         pages_response = []
         for page in pages:
@@ -448,7 +449,7 @@ async def facebook_auth(body: FacebookCodeRequest):
 
         # Save session temporarily (user_token + pages with their tokens)
         session_id = db.generate_id()
-        db.save_fb_session(session_id, {
+        await db.save_fb_session(session_id, {
             "user_access_token": user_token,
             "pages": pages,  # includes page access_tokens
         })
@@ -473,7 +474,7 @@ async def facebook_connect(body: FacebookConnectRequest):
     3. Lưu platform vào DB
     """
     # Get session
-    session = db.get_fb_session(body.session_id)
+    session = await db.get_fb_session(body.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session expired or not found. Please login again.")
 
@@ -503,7 +504,7 @@ async def facebook_connect(body: FacebookConnectRequest):
         if platform_id:
             try:
                 async with httpx.AsyncClient(timeout=3.0) as hc:
-                    wr = await hc.get(f"{WORKER_API_URL}/api/v1/platforms/{platform_id}")
+                    wr = await hc.get(f"{WORKER_API_URL}/api/v1/channels/{platform_id}")
                     worker_has_platform = wr.status_code == 200
             except Exception:
                 worker_has_platform = True  # worker unreachable — be safe, block duplicate
@@ -513,7 +514,7 @@ async def facebook_connect(body: FacebookConnectRequest):
             # Stale routing — worker data was cleared, allow reconnect
             logger.info("⚠️  Stale routing for page_id=%s — allowing reconnect", body.page_id)
             _routing.pop(body.page_id, None)
-            _save_routing()
+            await db.delete_routing_entry(body.page_id)
 
     page_token = selected_page["access_token"]
 
@@ -525,7 +526,7 @@ async def facebook_connect(body: FacebookConnectRequest):
 
         # Build platform record
         created_at = datetime.now(timezone.utc).isoformat()
-        platform_id = db.generate_id()
+        platform_id = f"facebook_page_{body.page_id}"
         platform = {
             "id": platform_id,
             "platform_type": "facebook",
@@ -539,6 +540,7 @@ async def facebook_connect(body: FacebookConnectRequest):
             "webhook_subscribed": True,
             "status": "active",
             "created_at": created_at,
+            "workspace_id": WORKSPACE_ID,
         }
 
         # ① Save minimal routing entry (page_id → platform_id + worker_uuid)
@@ -546,7 +548,14 @@ async def facebook_connect(body: FacebookConnectRequest):
             "platform_id": platform_id,
             "worker_uuid": os.getenv("WORKER_UUID", ""),
         }
-        _save_routing()
+        await db.set_routing_entry(body.page_id, _routing[body.page_id])
+
+        # ① Save platform data to platforms.json for resync (strip user token for safety)
+        existing = _load_platforms_json()
+        existing = [p for p in existing if p.get("page_id") != body.page_id]
+        platform_record = {k: v for k, v in platform.items() if k != "user_access_token"}
+        existing.append(platform_record)
+        _save_platforms_json(existing)
 
         # ② Send full platform data to worker SQLite via MQTT
         await mqtt_publisher.publish_save_platform(platform)
@@ -565,7 +574,7 @@ async def facebook_connect(body: FacebookConnectRequest):
         })
 
         # Cleanup session
-        db.delete_fb_session(body.session_id)
+        await db.delete_fb_session(body.session_id)
 
         logger.info("✅ Connected page '%s' (ID: %s)", selected_page["name"], body.page_id)
 
@@ -581,6 +590,7 @@ async def facebook_connect(body: FacebookConnectRequest):
             "success": True,
             "platform": {
                 "id": platform_id,
+                "channel_id": body.page_id,
                 "platform_type": "facebook",
                 "page_id": body.page_id,
                 "page_name": selected_page["name"],
@@ -628,7 +638,7 @@ async def disconnect_platform(platform_id: str):
 
     # Remove from routing
     _routing.pop(page_id, None)
-    _save_routing()
+    await db.delete_routing_entry(page_id)
 
     # Tell worker to purge all local data for this page
     from services.mqtt_publisher import publish_delete_page_data
@@ -703,7 +713,7 @@ async def resubscribe_webhook(platform_id: str):
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.patch(
-                f"{WORKER_API_URL}/api/v1/platforms/{platform_id}",
+                f"{WORKER_API_URL}/api/v1/channels/{platform_id}",
                 json={"webhook_subscribed": True},
             )
     except Exception:
@@ -761,7 +771,9 @@ async def resync_platforms():
         except Exception as e:
             logger.warning("Failed to sync page_id=%s: %s", page_id, e)
 
-    _save_routing()
+    # Persist any routing entries upserted to in-memory dict above
+    for pid, entry in _routing.items():
+        await db.set_routing_entry(pid, entry)
     logger.info("✅ Resync complete: %d platform(s)", synced)
     return {"message": f"Synced {synced} platform(s) to worker", "synced": synced}
 
@@ -882,15 +894,13 @@ async def admin_reset_all():
     result: dict = {}
 
     # ── Backend: clear routing ────────────────────────────────────────────────
+    await db.clear_routing()
     _routing = {}
-    _save_routing()
     result["routing"] = "cleared"
 
     # ── Backend: clear sessions ───────────────────────────────────────────────
     try:
-        sessions_file = os.path.join(os.path.dirname(__file__), "data", "fb_sessions.json")
-        with open(sessions_file, "w", encoding="utf-8") as f:
-            json.dump([], f)
+        await db.clear_fb_sessions()
         result["fb_sessions"] = "cleared"
     except Exception as e:
         result["fb_sessions"] = f"error: {e}"

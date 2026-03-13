@@ -1,37 +1,38 @@
 """
-JSON-file based database.
-Lưu dữ liệu vào data/*.json như một mini database.
+MongoDB-based database service for backend-chatbot.
+Replaces JSON file storage with Motor (async MongoDB driver).
 """
-import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Optional
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+import motor.motor_asyncio
 
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB  = os.getenv("BACKEND_DB_NAME", "chatbot_backend")
 
-def _ensure_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def _file_path(collection: str) -> str:
-    _ensure_dir()
-    return os.path.join(DATA_DIR, f"{collection}.json")
+_client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
+_db: Optional[motor.motor_asyncio.AsyncIOMotorDatabase] = None
 
 
-def _read(collection: str) -> list[dict]:
-    path = _file_path(collection)
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+async def init_db() -> None:
+    """Connect to MongoDB and create required indexes."""
+    global _client, _db
+    _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+    _db = _client[MONGO_DB]
+    # fb_sessions: TTL index — auto-expire documents after 3600 s
+    await _db.fb_sessions.create_index(
+        "created_at_ts", expireAfterSeconds=3600, name="ttl_fb_sessions"
+    )
+    # routing: unique on page_id
+    await _db.routing.create_index("page_id", unique=True, name="uq_routing_page_id")
 
 
-def _write(collection: str, data: list[dict]):
-    path = _file_path(collection)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+async def close_db() -> None:
+    if _client:
+        _client.close()
 
 
 def generate_id() -> str:
@@ -44,25 +45,50 @@ def now_iso() -> str:
 
 # ── Facebook OAuth sessions (temporary, for code exchange) ──────────────────
 
-def save_fb_session(session_id: str, data: dict):
+async def save_fb_session(session_id: str, data: dict) -> None:
     """Save temporary OAuth session (user access token + pages list)."""
-    sessions = _read("fb_sessions")
-    record = {"id": session_id, "created_at": now_iso(), **data}
-    # Replace if exists
-    sessions = [s for s in sessions if s["id"] != session_id]
-    sessions.append(record)
-    _write("fb_sessions", sessions)
+    doc = {
+        "id": session_id,
+        "created_at": now_iso(),
+        "created_at_ts": time.time(),  # numeric field used by TTL index
+        **data,
+    }
+    await _db.fb_sessions.replace_one({"id": session_id}, doc, upsert=True)
 
 
-def get_fb_session(session_id: str) -> dict | None:
-    for s in _read("fb_sessions"):
-        if s["id"] == session_id:
-            return s
-    return None
+async def get_fb_session(session_id: str) -> Optional[dict]:
+    return await _db.fb_sessions.find_one({"id": session_id}, {"_id": 0})
 
 
-def delete_fb_session(session_id: str):
-    sessions = _read("fb_sessions")
-    sessions = [s for s in sessions if s["id"] != session_id]
-    _write("fb_sessions", sessions)
+async def delete_fb_session(session_id: str) -> None:
+    await _db.fb_sessions.delete_one({"id": session_id})
+
+
+async def clear_fb_sessions() -> None:
+    await _db.fb_sessions.delete_many({})
+
+
+# ── Routing table: { page_id → { platform_id, worker_uuid, ... } } ──────────
+
+async def get_routing() -> dict:
+    """Return full routing table as a plain dict: { page_id → entry }."""
+    docs = await _db.routing.find({}, {"_id": 0}).to_list(length=None)
+    return {d["page_id"]: {k: v for k, v in d.items() if k != "page_id"} for d in docs}
+
+
+async def set_routing_entry(page_id: str, entry: dict) -> None:
+    """Upsert a single routing entry."""
+    await _db.routing.replace_one(
+        {"page_id": page_id},
+        {"page_id": page_id, **{k: v for k, v in entry.items() if k != "page_id"}},
+        upsert=True,
+    )
+
+
+async def delete_routing_entry(page_id: str) -> None:
+    await _db.routing.delete_one({"page_id": page_id})
+
+
+async def clear_routing() -> None:
+    await _db.routing.delete_many({})
 

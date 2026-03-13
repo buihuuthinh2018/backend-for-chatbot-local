@@ -158,9 +158,10 @@ async def publish_message_event(
         "jwt_token": _build_jwt(WORKER_UUID),
         "payload": {
             "platform_type": "facebook",
-            "platform_id": platform["id"],
-            "page_id": platform["page_id"],
-            "customer_id": sender_psid,
+            "channel_id": platform["page_id"],
+            "workspace_id": platform.get("workspace_id", ""),
+            "user_id": sender_psid,
+            "customer_id": sender_psid,          # backward compat
             "customer_name": "",
             "message": {
                 "content_type": content_type,
@@ -168,7 +169,6 @@ async def publish_message_event(
                 "content_url": content_url,
             },
             "platform_message_id": platform_msg_id,
-            # Standalone extension: worker dÃ¹ng khi khÃ´ng cÃ³ token trong SQLite
             "_standalone": {
                 "page_access_token": platform.get("page_access_token", ""),
             },
@@ -208,13 +208,14 @@ async def publish_save_platform(platform: dict) -> bool:
         "type": "save_platform",
         "jwt_token": _build_jwt(WORKER_UUID),
         "payload": {
-            "platform_id":       platform["id"],
+            "id":                platform.get("id", ""),
             "platform_type":     platform.get("platform_type", "facebook"),
-            "page_id":           platform["page_id"],
+            "channel_id":        platform["page_id"],
+            "workspace_id":      platform.get("workspace_id", ""),
             "page_access_token": platform.get("page_access_token", ""),
-            "page_name":         platform.get("page_name", ""),
-            "page_category":     platform.get("page_category", ""),
-            "page_picture_url":  platform.get("page_picture_url", ""),
+            "name":              platform.get("page_name", ""),
+            "avatar":            platform.get("page_picture_url", ""),
+            "category":          platform.get("page_category", ""),
             "fan_count":         platform.get("fan_count", 0),
             "status":            platform.get("status", "active"),
             "created_at":        platform.get("created_at", ""),
@@ -252,7 +253,7 @@ async def publish_bot_config(
         "type": "update_bot_config",
         "jwt_token": _build_jwt(WORKER_UUID),
         "payload": {
-            "page_id":              platform.get("page_id",             ""),
+            "channel_id":           platform.get("page_id",             ""),
             "chatbot_name":         platform.get("chatbot_name",        ""),
             "page_name":            platform.get("page_name",           ""),
             "chatbot_description":  platform.get("chatbot_description", ""),
@@ -313,8 +314,9 @@ async def publish_delivery_event(
         "jwt_token": _build_jwt(WORKER_UUID),
         "payload": {
             "platform_type": "facebook",
-            "platform_id": platform["id"],
-            "page_id": platform["page_id"],
+            "channel_id": platform["page_id"],
+            "workspace_id": platform.get("workspace_id", ""),
+            "user_id": customer_id,
             "customer_id": customer_id,
             "mids": mids,
             "watermark": watermark,
@@ -356,8 +358,7 @@ async def publish_delete_page_data(page_id: str, platform_id: str) -> bool:
         "type": "delete_page_data",
         "jwt_token": _build_jwt(WORKER_UUID),
         "payload": {
-            "page_id": page_id,
-            "platform_id": platform_id,
+            "channel_id": page_id,
         },
     }
 

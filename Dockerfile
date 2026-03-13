@@ -4,6 +4,8 @@ FROM python:3.11-slim
 # 2️⃣ Tắt bytecode và bật log realtime
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV MONGO_URI=mongodb://mongodb:27017
+ENV BACKEND_DB_NAME=chatbot_backend
 
 # 3️⃣ Tạo thư mục làm việc
 WORKDIR /app
