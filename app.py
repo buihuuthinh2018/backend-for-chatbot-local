@@ -312,11 +312,9 @@ async def fb_webhook_event(request: Request):
 
             # ── Route to MQTT only for processable event types ────────────────
             if is_echo:
-                # Echo từ app/bot gửi (có app_id) → bỏ qua, worker đã lưu tin nhắn rồi.
-                # Chỉ forward echo từ agent gõ trực tiếp trên Facebook Inbox (không có app_id).
-                if event.get("message", {}).get("app_id"):
-                    logger.debug("Skipping bot echo (app_id=%s)", event["message"]["app_id"])
-                    continue
+                # Forward ALL echoes (bot + agent) to worker.
+                # Worker's idempotency check deduplicates bot echoes already saved by _send_and_save().
+                # Agent/Business-Suite echoes (e.g. images sent from FB Inbox) are only saved via this path.
                 event_type    = "message_echo"
                 customer_psid = recipient_id   # the human who received the message
             elif raw_event_type in ("message", "postback"):

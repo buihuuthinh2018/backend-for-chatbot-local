@@ -17,11 +17,7 @@ env/
 .env.*.local
 
 # ── Sensitive runtime data (chứa access tokens thực) ─────────────────────────
-data/platforms.json
-data/fb_sessions.json
-data/fb_connect_logs/
-data/fb_webhooks/
-
+data
 # ── Windows artifacts ─────────────────────────────────────────────────────────
 nul
 Thumbs.db

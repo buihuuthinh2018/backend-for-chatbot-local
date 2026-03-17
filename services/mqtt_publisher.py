@@ -107,7 +107,8 @@ async def publish_message_event(
     # â”€â”€ TrÃ­ch xuáº¥t ná»™i dung tin nháº¯n â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     content_text = ""
     platform_msg_id = ""
-    command_type = "new_message"   # default â€” override for echo below
+    command_type = "new_message"   # default — override for echo below
+    echo_sender_type = None        # set for echoes only
 
     if event_type == "message":
         msg_obj = event_data.get("message", {})
@@ -130,6 +131,8 @@ async def publish_message_event(
         msg_obj = event_data.get("message", {})
         platform_msg_id = msg_obj.get("mid", "")
         command_type = "agent_message"
+        # Detect sender: bot (has app_id) vs agent (typed in FB Inbox, no app_id)
+        echo_sender_type = "bot" if msg_obj.get("app_id") else "agent"
         # Handle attachment echoes (e.g. agent sent image/video from FB inbox)
         attachments = msg_obj.get("attachments", [])
         if attachments:
@@ -168,6 +171,7 @@ async def publish_message_event(
                 "content_text": content_text,
                 "content_url": content_url,
             },
+            "sender_type": echo_sender_type if command_type == "agent_message" else None,
             "platform_message_id": platform_msg_id,
             "_standalone": {
                 "page_access_token": platform.get("page_access_token", ""),
