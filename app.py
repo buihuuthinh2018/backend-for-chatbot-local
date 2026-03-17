@@ -25,6 +25,8 @@ from pydantic import BaseModel
 
 from services import facebook, db, mqtt_publisher
 
+ENABLE_VERIFY_WEBHOOK = os.getenv("ENABLE_VERIFY_WEBHOOK", "true").lower() in ("true", "1", "yes")
+
 # ── Routing table: { page_id → { platform_id, worker_uuid } } ───────────────────
 # Full platform data (tokens, config) lives in worker SQLite.
 # Backend only needs this lightweight map to route webhooks.
@@ -239,11 +241,12 @@ async def fb_webhook_event(request: Request):
     logger.info("=" * 50)
     logger.info("🔔 Facebook webhook event received (%d bytes)", len(body))
 
-    # Verify signature (bỏ qua nếu APP_SECRET chưa set — chỉ dùng trong dev)
-    sig_header = request.headers.get("X-Hub-Signature-256", "")
-    if sig_header and not facebook.verify_signature(body, sig_header):
-        logger.warning("❌ Invalid webhook signature")
-        raise HTTPException(status_code=403, detail="Invalid signature")
+    # Verify signature (tắt bằng ENABLE_VERIFY_WEBHOOK=false trong .env)
+    if ENABLE_VERIFY_WEBHOOK:
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        if sig_header and not facebook.verify_signature(body, sig_header):
+            logger.warning("❌ Invalid webhook signature")
+            raise HTTPException(status_code=403, detail="Invalid signature")
 
     data = await request.json()
 
@@ -309,6 +312,11 @@ async def fb_webhook_event(request: Request):
 
             # ── Route to MQTT only for processable event types ────────────────
             if is_echo:
+                # Echo từ app/bot gửi (có app_id) → bỏ qua, worker đã lưu tin nhắn rồi.
+                # Chỉ forward echo từ agent gõ trực tiếp trên Facebook Inbox (không có app_id).
+                if event.get("message", {}).get("app_id"):
+                    logger.debug("Skipping bot echo (app_id=%s)", event["message"]["app_id"])
+                    continue
                 event_type    = "message_echo"
                 customer_psid = recipient_id   # the human who received the message
             elif raw_event_type in ("message", "postback"):
