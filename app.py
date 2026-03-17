@@ -488,6 +488,11 @@ async def facebook_connect(body: FacebookConnectRequest):
     if not selected_page:
         raise HTTPException(status_code=400, detail="Page not found in your account list.")
 
+    # Lấy page token từ session (đã fetch ở bước auth, không subscribe ở đó)
+    page_token = selected_page.get("access_token")
+    if not page_token:
+        raise HTTPException(status_code=400, detail="Không tìm thấy token cho page này trong session. Vui lòng đăng nhập lại.")
+
     # 📝 Log toàn bộ payload request kết nối của user
     _save_fb_connect_log("connect_request", {
         "session_id": body.session_id,
@@ -515,8 +520,6 @@ async def facebook_connect(body: FacebookConnectRequest):
             logger.info("⚠️  Stale routing for page_id=%s — allowing reconnect", body.page_id)
             _routing.pop(body.page_id, None)
             await db.delete_routing_entry(body.page_id)
-
-    page_token = selected_page["access_token"]
 
     try:
         # Subscribe webhook

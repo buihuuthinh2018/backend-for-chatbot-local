@@ -1,38 +1,49 @@
 """
-MongoDB-based database service for backend-chatbot.
-Replaces JSON file storage with Motor (async MongoDB driver).
+JSON-file-based database service for backend-chatbot.
+All data is persisted in the data/ directory as JSON files.
 """
+import json
 import os
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import motor.motor_asyncio
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+_ROUTING_FILE  = os.path.join(_DATA_DIR, "routing.json")
+_SESSIONS_FILE = os.path.join(_DATA_DIR, "fb_sessions.json")
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB  = os.getenv("BACKEND_DB_NAME", "chatbot_backend")
+# TTL for fb_sessions (seconds)
+_SESSION_TTL = 3600
 
-_client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
-_db: Optional[motor.motor_asyncio.AsyncIOMotorDatabase] = None
+
+def _ensure_data_dir() -> None:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+
+
+def _read_json(path: str) -> dict:
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _write_json(path: str, data: dict) -> None:
+    _ensure_data_dir()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 async def init_db() -> None:
-    """Connect to MongoDB and create required indexes."""
-    global _client, _db
-    _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-    _db = _client[MONGO_DB]
-    # fb_sessions: TTL index — auto-expire documents after 3600 s
-    await _db.fb_sessions.create_index(
-        "created_at_ts", expireAfterSeconds=3600, name="ttl_fb_sessions"
-    )
-    # routing: unique on page_id
-    await _db.routing.create_index("page_id", unique=True, name="uq_routing_page_id")
+    """Ensure data directory exists. No external connection needed."""
+    _ensure_data_dir()
 
 
 async def close_db() -> None:
-    if _client:
-        _client.close()
+    pass  # nothing to close
 
 
 def generate_id() -> str:
@@ -47,48 +58,61 @@ def now_iso() -> str:
 
 async def save_fb_session(session_id: str, data: dict) -> None:
     """Save temporary OAuth session (user access token + pages list)."""
-    doc = {
+    sessions = _read_json(_SESSIONS_FILE)
+    sessions[session_id] = {
         "id": session_id,
         "created_at": now_iso(),
-        "created_at_ts": time.time(),  # numeric field used by TTL index
+        "created_at_ts": time.time(),
         **data,
     }
-    await _db.fb_sessions.replace_one({"id": session_id}, doc, upsert=True)
+    _write_json(_SESSIONS_FILE, sessions)
 
 
 async def get_fb_session(session_id: str) -> Optional[dict]:
-    return await _db.fb_sessions.find_one({"id": session_id}, {"_id": 0})
+    sessions = _read_json(_SESSIONS_FILE)
+    entry = sessions.get(session_id)
+    if not entry:
+        return None
+    # Honour TTL
+    if time.time() - entry.get("created_at_ts", 0) > _SESSION_TTL:
+        sessions.pop(session_id)
+        _write_json(_SESSIONS_FILE, sessions)
+        return None
+    return entry
 
 
 async def delete_fb_session(session_id: str) -> None:
-    await _db.fb_sessions.delete_one({"id": session_id})
+    sessions = _read_json(_SESSIONS_FILE)
+    if session_id in sessions:
+        sessions.pop(session_id)
+        _write_json(_SESSIONS_FILE, sessions)
 
 
 async def clear_fb_sessions() -> None:
-    await _db.fb_sessions.delete_many({})
+    _write_json(_SESSIONS_FILE, {})
 
 
 # ── Routing table: { page_id → { platform_id, worker_uuid, ... } } ──────────
 
 async def get_routing() -> dict:
     """Return full routing table as a plain dict: { page_id → entry }."""
-    docs = await _db.routing.find({}, {"_id": 0}).to_list(length=None)
-    return {d["page_id"]: {k: v for k, v in d.items() if k != "page_id"} for d in docs}
+    return _read_json(_ROUTING_FILE)
 
 
 async def set_routing_entry(page_id: str, entry: dict) -> None:
     """Upsert a single routing entry."""
-    await _db.routing.replace_one(
-        {"page_id": page_id},
-        {"page_id": page_id, **{k: v for k, v in entry.items() if k != "page_id"}},
-        upsert=True,
-    )
+    routing = _read_json(_ROUTING_FILE)
+    routing[page_id] = {k: v for k, v in entry.items() if k != "page_id"}
+    _write_json(_ROUTING_FILE, routing)
 
 
 async def delete_routing_entry(page_id: str) -> None:
-    await _db.routing.delete_one({"page_id": page_id})
+    routing = _read_json(_ROUTING_FILE)
+    if page_id in routing:
+        routing.pop(page_id)
+        _write_json(_ROUTING_FILE, routing)
 
 
 async def clear_routing() -> None:
-    await _db.routing.delete_many({})
+    _write_json(_ROUTING_FILE, {})
 

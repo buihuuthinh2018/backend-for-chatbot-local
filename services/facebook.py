@@ -73,8 +73,8 @@ async def get_long_lived_token(short_token: str) -> dict:
 
 async def get_user_pages(user_access_token: str) -> list[dict]:
     """
-    Step 2: Dùng User Access Token để lấy danh sách Pages người dùng quản lý.
-    Chỉ lấy pages mà user có quyền gửi tin nhắn.
+    Lấy danh sách Pages người dùng quản lý kèm page access_token.
+    Token được lưu vào session — chỉ dùng khi user nhấn Connect, không subscribe ngay.
     """
     pages = []
     url = f"{FB_GRAPH_URL}/me/accounts"
@@ -98,7 +98,7 @@ async def get_user_pages(user_access_token: str) -> list[dict]:
                     "page_id": page["id"],
                     "name": page["name"],
                     "category": page.get("category", ""),
-                    "access_token": page["access_token"],  # Page Access Token (long-lived inherits)
+                    "access_token": page["access_token"],  # page-scoped token, lưu vào session
                     "picture_url": page.get("picture", {}).get("data", {}).get("url", ""),
                     "fan_count": page.get("fan_count", 0),
                     "is_published": page.get("is_published", True),
